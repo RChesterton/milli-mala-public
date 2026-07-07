@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.5
+// @version      0.5.6
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -1116,6 +1116,29 @@
     const anchorRect = anchorEl.getBoundingClientRect();
     let best = null;
 
+    for (let el = anchorEl; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 280 || rect.width > 520) continue;
+      if (rect.height < Math.max(260, fallbackBounds.height - 2) || rect.height > window.innerHeight) continue;
+      if (!rectContainsRect(rect, anchorRect)) continue;
+
+      const style = getComputedStyle(el);
+      const radius = Math.max(
+        parseFloat(style.borderTopLeftRadius) || 0,
+        parseFloat(style.borderTopRightRadius) || 0,
+        parseFloat(style.borderBottomLeftRadius) || 0,
+        parseFloat(style.borderBottomRightRadius) || 0
+      );
+      const painted = style.backgroundColor !== "transparent" && style.backgroundColor !== "rgba(0, 0, 0, 0)";
+      const shadowed = style.boxShadow && style.boxShadow !== "none";
+
+      if (painted && radius >= 6 && shadowed && style.overflow === "hidden") {
+        const bounds = normalizedBounds(rect);
+        bounds.isPopup = true;
+        return bounds;
+      }
+    }
+
     for (let childOnPath = anchorEl; childOnPath && childOnPath !== document.body; childOnPath = childOnPath.parentElement) {
       const row = childOnPath.parentElement;
       if (!row || row === document.body || row === document.documentElement) continue;
@@ -1211,8 +1234,10 @@
       top = bounds.top + Math.min(64, Math.max(margin, bounds.height - height - margin));
     }
 
-    left = clamp(left, bounds.left + margin, bounds.right - width - margin);
-    top = clamp(top, bounds.top + margin, bounds.bottom - height - margin);
+    if (!isFacebookPopup) {
+      left = clamp(left, bounds.left + margin, bounds.right - width - margin);
+      top = clamp(top, bounds.top + margin, bounds.bottom - height - margin);
+    }
 
     panel.style.width = Math.round(width) + "px";
     panel.style.minWidth = Math.round(Math.min(width, COMPOSE_MIN_WIDTH)) + "px";

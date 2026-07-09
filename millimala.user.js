@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.6
+// @version      0.5.7
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -1334,6 +1334,8 @@
     const err = new Error(message);
     err.status = status;
     err.errorClass = json && json.error_class ? json.error_class : "";
+    err.actions = json && Array.isArray(json.actions) ? json.actions : [];
+    err.provider = json && json.provider ? json.provider : null;
     return err;
   }
 
@@ -1558,13 +1560,13 @@
     }
   }
 
-  function postTranslate(mode, model, text) {
+  function postTranslate(mode, model, text, providerAction = "") {
     const timeout = mode.endsWith("+") || model === "high" ? 240000 : 160000;
-    return callApi("/translate", { mode, model, text }, timeout);
+    return callApi("/translate", { mode, model, text, providerAction }, timeout);
   }
 
-  function postCompose(tone, text) {
-    return callApi("/compose", { model: "medium", tone, text }, 240000);
+  function postCompose(tone, text, providerAction = "") {
+    return callApi("/compose", { model: "medium", tone, text, providerAction }, 240000);
   }
 
   function closeMenu() {
@@ -1659,6 +1661,46 @@
     showTextPanel(anchorEl, title, err && err.message ? err.message : String(err), true, "", "", targetEl, placement);
   }
 
+  function helperActions(err) {
+    return err && Array.isArray(err.actions) ? err.actions.filter(action => action && action.id && action.label) : [];
+  }
+
+  function showActionError(anchorEl, title, err, onAction, targetEl = null, placement = null) {
+    const actions = helperActions(err);
+    if (!actions.length) {
+      showError(anchorEl, title, err, targetEl, placement);
+      return;
+    }
+
+    const { panel, body } = createPanel(anchorEl, title, true);
+    const message = document.createElement("div");
+    message.className = CLASS.pre;
+    message.textContent = err && err.message ? err.message : String(err);
+    body.appendChild(message);
+
+    const section = document.createElement("div");
+    section.className = CLASS.section;
+
+    for (const action of actions) {
+      const button = document.createElement("button");
+      button.className = `${CLASS.button} ${CLASS.secondaryButton}`;
+      button.type = "button";
+      button.textContent = action.label;
+      button.title = action.label;
+      button.style.marginRight = "6px";
+      button.style.marginTop = "6px";
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        onAction(action, button);
+      });
+      section.appendChild(button);
+    }
+
+    body.appendChild(section);
+    placeTranslatePanel(panel, anchorEl, targetEl, placement);
+  }
+
   function addMenuButton(menu, label, title, action) {
     const button = document.createElement("button");
     button.className = CLASS.menuButton;
@@ -1726,7 +1768,7 @@
     placeTranslateMenu(menu, messageEl, targetEl, placement);
   }
 
-  async function translateActiveMessage(mode, model, label, button) {
+  async function translateActiveMessage(mode, model, label, button, providerAction = "") {
     const context = activeContext;
     const messageEl = context && context.messageEl;
     const targetEl = context && context.targetEl;
@@ -1746,7 +1788,7 @@
       messageEl.__rcLocalTranslateCache = {};
     }
 
-    const cacheKey = `${mode}:${model}:${text}`;
+    const cacheKey = `${mode}:${model}:${providerAction}:${text}`;
 
     if (messageEl.__rcLocalTranslateCache[cacheKey]) {
       const cachedText = messageEl.__rcLocalTranslateCache[cacheKey];
@@ -1754,11 +1796,13 @@
       return;
     }
 
-    const originalButtonText = button.textContent;
+    const originalButtonText = button ? button.textContent : "";
 
     try {
-      button.disabled = true;
-      button.textContent = "Translating…";
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Translating…";
+      }
 
       showTextPanel(
         messageEl,
@@ -1771,7 +1815,7 @@
         placement
       );
 
-      const response = await postTranslate(mode, model, text);
+      const response = await postTranslate(mode, model, text, providerAction);
       const resultText = String(response.text || "");
       const noticeText = String(response.notice || "").trim();
       const displayText = noticeText ? `${noticeText}\n\n${resultText}` : resultText;
@@ -1781,10 +1825,18 @@
       const modelLabel = response.cached ? "cached" : (response.modelName || response.model || model);
       showTextPanel(messageEl, `${label} · ${modelLabel}`, displayText, false, resultText, "", targetEl, placement);
     } catch (err) {
-      showError(messageEl, `${label} error`, err, targetEl, placement);
+      if (helperActions(err).length) {
+        showActionError(messageEl, `${label} error`, err, (action, actionButton) => {
+          translateActiveMessage(mode, model, label, actionButton, action.id);
+        }, targetEl, placement);
+      } else {
+        showError(messageEl, `${label} error`, err, targetEl, placement);
+      }
     } finally {
-      button.disabled = false;
-      button.textContent = originalButtonText;
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalButtonText;
+      }
     }
   }
 
@@ -1889,6 +1941,36 @@
     }
   }
 
+  function renderHelperActionErrorHtml(err) {
+    const actions = helperActions(err);
+
+    return `
+      <div class="${CLASS.pre}">${h(err && err.message ? err.message : err)}</div>
+      ${actions.length ? `
+        <div class="${CLASS.section}">
+          ${actions.map(action => `
+            <button
+              type="button"
+              class="${CLASS.button} ${CLASS.secondaryButton}"
+              data-rc-provider-action="${h(action.id)}"
+              style="margin-top:6px;margin-right:6px"
+            >${h(action.label)}</button>
+          `).join("")}
+        </div>
+      ` : ""}
+    `;
+  }
+
+  function wireHelperActionButtons(container, onAction) {
+    for (const button of container.querySelectorAll("[data-rc-provider-action]")) {
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        onAction(button.getAttribute("data-rc-provider-action") || "", button);
+      });
+    }
+  }
+
   function showComposePanel(composerEl) {
     const initialText = extractComposerText(composerEl);
     const { body } = createPanel(composerEl, "Write Icelandic", false);
@@ -1939,18 +2021,41 @@
         return;
       }
 
+      const renderComposeError = err => {
+        outputEl.innerHTML = renderHelperActionErrorHtml(err);
+        wireHelperActionButtons(outputEl, async (providerAction, actionButton) => {
+          const originalActionText = actionButton.textContent;
+          try {
+            actionButton.disabled = true;
+            actionButton.textContent = "Generating…";
+            await runCompose(providerAction);
+          } finally {
+            if (actionButton.isConnected) {
+              actionButton.disabled = false;
+              actionButton.textContent = originalActionText;
+            }
+          }
+        });
+        placeComposePanel(activePanel, composerEl);
+      };
+
+      const runCompose = async (providerAction = "") => {
+        try {
+          const response = await postCompose(tone, text, providerAction);
+          outputEl.innerHTML = renderComposeResultHtml(response);
+          wireComposeCopyButtons(outputEl, response);
+          placeComposePanel(activePanel, composerEl);
+        } catch (err) {
+          renderComposeError(err);
+        }
+      };
+
       generateEl.disabled = true;
       outputEl.innerHTML = `<div class="${CLASS.pre}">Generating…</div>`;
       placeComposePanel(activePanel, composerEl);
 
       try {
-        const response = await postCompose(tone, text);
-        outputEl.innerHTML = renderComposeResultHtml(response);
-        wireComposeCopyButtons(outputEl, response);
-        placeComposePanel(activePanel, composerEl);
-      } catch (err) {
-        outputEl.innerHTML = `<div class="${CLASS.pre}">${h(err && err.message ? err.message : err)}</div>`;
-        placeComposePanel(activePanel, composerEl);
+        await runCompose();
       } finally {
         generateEl.disabled = false;
       }

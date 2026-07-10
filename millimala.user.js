@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.7
+// @version      0.5.8
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -1350,6 +1350,30 @@
     }
   }
 
+  // A genuine helper reply is always a JSON object/array. A body that starts with
+  // anything else (typically an HTML gateway/proxy/error page) is not JSON — surface a
+  // clear gateway error instead of a raw "Unexpected token '<'" parse failure. This is
+  // deliberately NOT an auth signal: Cloudflare Access re-auth is detected only on the
+  // GM onerror/status-0 path (isCloudflareAccessAuthRequiredFromGm), never here.
+  function bodyLooksLikeJsonContainer(text) {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) return true; // empty body is handled as {} by parseHelperJson
+    const first = trimmed[0];
+    return first === "{" || first === "[";
+  }
+
+  function nonJsonHelperError(status, text) {
+    const trimmed = String(text || "").trim();
+    const looksHtml = /^<(?:!doctype|html|head|body|\?xml|\/)/i.test(trimmed) || trimmed.startsWith("<");
+    const kind = looksHtml
+      ? "an HTML page (likely a gateway, proxy, or access error page)"
+      : "a non-JSON response";
+    const err = new Error(`Milli Mála helper returned ${kind} instead of JSON (HTTP ${status || "unknown"}). This is usually a temporary gateway or proxy problem — wait a moment and try again.`);
+    err.status = status;
+    err.errorClass = looksHtml ? "gateway_html_response" : "non_json_response";
+    return err;
+  }
+
   function sleep(ms) {
     return new Promise(resolve => window.setTimeout(resolve, ms));
   }
@@ -1422,7 +1446,14 @@
       timeout
     });
 
-    const json = parseHelperJson(response.responseText || "{}", response.status);
+    const body = response.responseText || "{}";
+
+    if (!bodyLooksLikeJsonContainer(body)) {
+      log("non_json_helper_response", response.status);
+      throw nonJsonHelperError(response.status, body);
+    }
+
+    const json = parseHelperJson(body, response.status);
 
     if (response.status < 200 || response.status >= 300 || !json.ok) {
       throw helperErrorFromResponse(response.status, json);

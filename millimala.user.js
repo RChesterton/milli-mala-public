@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.8
+// @version      0.5.9
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -39,6 +39,10 @@
   const PANEL_GAP = 6;
   const COMPOSE_MIN_WIDTH = 270;
   const COMPOSE_MIN_HEIGHT = 220;
+  // Block sending past this length (matches the helper's MAX_INPUT_CHARS backstop).
+  // Real messages never approach it; this just prevents an over-long send gracefully
+  // instead of the helper silently truncating.
+  const MAX_INPUT_CHARS = 10000;
 
   const CLASS = {
     menu: "rc-local-translate-menu",
@@ -1902,7 +1906,7 @@
               <div class="${CLASS.pre}">${h(text)}</div>
               ${english ? `<div class="${CLASS.small}" style="margin-top:5px">${h(english)}</div>` : ""}
               ${Array.isArray(breakdown) && breakdown.length ? `<div style="margin-top:6px">${renderBreakdownHtml(breakdown)}</div>` : ""}
-              ${notes ? `<div class="${CLASS.small}" style="margin-top:5px">${h(notes)}</div>` : ""}
+              ${notes && notes.trim() ? `<div class="${CLASS.small}" style="margin-top:5px">${h(notes)}</div>` : ""}
               <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-copy-alt="${index}" style="margin-top:6px">Copy</button>
             </div>
           `;
@@ -1940,7 +1944,7 @@
         ${altHtml}
       </div>
 
-      ${data.notes ? `
+      ${data.notes && String(data.notes).trim() ? `
         <div class="${CLASS.section}">
           <div class="${CLASS.small}">Notes</div>
           <div class="${CLASS.pre}">${h(data.notes)}</div>
@@ -2012,6 +2016,7 @@
       <div class="${CLASS.section}">
         <div class="${CLASS.label}">Draft text read from composer</div>
         <textarea class="${CLASS.textarea}" data-rc-compose-text>${h(initialText)}</textarea>
+        <div class="${CLASS.small}" data-rc-compose-warning style="display:none;margin-top:4px;color:#ff5a5a"></div>
       </div>
 
       <div class="${CLASS.formRow}">
@@ -2038,11 +2043,32 @@
     const textEl = body.querySelector("[data-rc-compose-text]");
     const toneEl = body.querySelector("[data-rc-compose-tone]");
     const generateEl = body.querySelector("[data-rc-compose-generate]");
+    const warningEl = body.querySelector("[data-rc-compose-warning]");
     const outputEl = body.querySelector("[data-rc-compose-output]");
+
+    // Block sending an over-long draft: grey out Generate and warn, instead of
+    // letting the helper silently truncate. Recomputed on every edit.
+    function refreshComposeLimit() {
+      const length = String(textEl.value || "").length;
+      const overLimit = length > MAX_INPUT_CHARS;
+      generateEl.disabled = overLimit;
+      if (warningEl) {
+        warningEl.style.display = overLimit ? "" : "none";
+        warningEl.textContent = overLimit
+          ? `Too long to send: ${length.toLocaleString()} / ${MAX_INPUT_CHARS.toLocaleString()} characters. Shorten it to generate.`
+          : "";
+      }
+      return overLimit;
+    }
+
+    textEl.addEventListener("input", refreshComposeLimit);
+    refreshComposeLimit();
 
     generateEl.addEventListener("click", async event => {
       event.preventDefault();
       event.stopPropagation();
+
+      if (refreshComposeLimit()) return;
 
       const text = String(textEl.value || "").trim();
       const tone = String(toneEl.value || "casual");
@@ -2089,6 +2115,7 @@
         await runCompose();
       } finally {
         generateEl.disabled = false;
+        refreshComposeLimit();
       }
     });
   }

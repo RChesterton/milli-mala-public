@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.9
+// @version      0.5.10
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -214,7 +214,7 @@
       .${CLASS.panel} {
         position: fixed;
         z-index: 2147483647;
-        min-width: min(270px, calc(100vw - 32px));
+        min-width: min(150px, calc(100vw - 32px));
         max-width: min(520px, calc(100vw - 32px));
         max-height: min(460px, calc(100vh - 32px));
         overflow: hidden;
@@ -288,10 +288,6 @@
       .${CLASS.panel}.${CLASS.error} {
         border-color: rgba(255,90,90,0.45);
         background: rgba(55,20,20,0.96);
-      }
-
-      .${CLASS.panel}.${CLASS.loading} {
-        width: 300px;
       }
 
       .${CLASS.panel}.${CLASS.loading} .${CLASS.panelBody} {
@@ -867,7 +863,10 @@
     return Math.min(max, Math.max(min, value));
   }
 
-  function setPanelUsableWidth(panel, bounds, preferredMax = 520, preferredMin = 270) {
+  // preferredMin is a small floor (buttons fit); the header.scrollWidth measurement
+  // below is the real "fit the header items" width, and the body grows it only when
+  // the text needs more. Start at header width, expand for content — not the reverse.
+  function setPanelUsableWidth(panel, bounds, preferredMax = 520, preferredMin = 150) {
     const available = Math.max(preferredMin, bounds.width - 2 * VIEWPORT_MARGIN);
     const maxWidth = Math.max(preferredMin, Math.min(preferredMax, available));
 

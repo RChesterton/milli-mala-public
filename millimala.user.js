@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.10
-// @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Never sends, reacts, clicks Messenger, or edits the composer.
+// @version      0.5.12
+// @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @match        https://www.facebook.com/*
@@ -32,9 +32,16 @@
     debug: false
   };
 
+  // Printed once on load, so the running copy is always identifiable. During a debug cycle
+  // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
+  // means this is the released artifact.
+  const BUILD_ID = "0.5.12";
+
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
   const AUTH_POLL_MAX_ATTEMPTS = 120;
+  const NOT_FOUND_RETRY_DELAY_MS = 400;
+  const SELECTION_SYNC_TIMEOUT_MS = 50;
   const VIEWPORT_MARGIN = 12;
   const PANEL_GAP = 6;
   const COMPOSE_MIN_WIDTH = 270;
@@ -60,8 +67,6 @@
     compose: "rc-local-translate-compose",
     resizeHandle: "rc-local-translate-resize-handle",
     formRow: "rc-local-translate-form-row",
-    formGroup: "rc-local-translate-form-group",
-    label: "rc-local-translate-label",
     textarea: "rc-local-translate-textarea",
     select: "rc-local-translate-select",
     button: "rc-local-translate-button",
@@ -71,7 +76,8 @@
     small: "rc-local-translate-small",
     breakdown: "rc-local-translate-breakdown",
     phrase: "rc-local-translate-phrase",
-    alt: "rc-local-translate-alt"
+    alt: "rc-local-translate-alt",
+    buttonRow: "rc-local-translate-button-row"
   };
 
   const TONES = [
@@ -297,6 +303,7 @@
       .${CLASS.panel}.${CLASS.compose} .${CLASS.panelBody} {
         white-space: normal;
         overflow: auto;
+        font-size: 11px;
       }
 
       .${CLASS.panel}.${CLASS.compose} .${CLASS.panelHeader} {
@@ -329,19 +336,13 @@
 
       .${CLASS.formRow} {
         display: flex;
-        align-items: end;
+        align-items: center;
         gap: 8px;
         flex-wrap: wrap;
         margin-top: 8px;
       }
 
-      .${CLASS.formGroup} {
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
-      }
-
-      .${CLASS.label}, .${CLASS.small} {
+      .${CLASS.small} {
         color: rgba(255,255,255,0.72);
         font-size: 11px;
         line-height: 1.3;
@@ -352,25 +353,34 @@
         background: rgba(0,0,0,0.22);
         color: white;
         border-radius: 8px;
-        font-size: 12px;
+        font-size: 11px;
         line-height: 1.35;
         outline: none;
       }
 
+      /* Starts ~2 lines tall and is auto-grown to fit the draft by autoSizeTextarea(). */
       .${CLASS.textarea} {
         display: block;
         width: 100%;
-        min-height: 82px;
+        min-height: 46px;
         max-height: 170px;
         resize: vertical;
         padding: 8px;
-        margin-top: 4px;
+        margin-top: 0;
         white-space: pre-wrap;
       }
 
       .${CLASS.select} {
         min-width: 106px;
-        padding: 6px 7px;
+        padding: 0 6px;
+      }
+
+      /* Generate carries .secondaryButton, so it is already sized like Use/Copy. Match the
+         Tone select to it: 11px text + 4px padding + 1px border, top and bottom. */
+      .${CLASS.panel}.${CLASS.compose} .${CLASS.formRow} .${CLASS.select} {
+        height: 21px;
+        font-size: 11px;
+        line-height: 1;
       }
 
       .${CLASS.button} {
@@ -422,13 +432,28 @@
       }
 
       .${CLASS.phrase} {
-        font-weight: 650;
+        font-weight: 600;
       }
 
       .${CLASS.alt} {
         margin-top: 7px;
         padding-top: 7px;
         border-top: 1px solid rgba(255,255,255,0.10);
+      }
+
+      /* The section rule already draws a divider above the first alternative;
+         its own border would double it. */
+      .${CLASS.alt}:first-child {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: 0;
+      }
+
+      .${CLASS.buttonRow} {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 6px;
       }
     `;
 
@@ -1565,6 +1590,44 @@
     };
   }
 
+  // A 404 from /translate or /compose is impossible in normal operation — those routes always
+  // exist. Seen once (2026-07-11) as a GET the userscript never sent, meaning something turned
+  // the POST into a GET and dropped the body. Cause unknown, so this treats the symptom only.
+  // Deliberately NOT wired into the Cloudflare Access path: that keys off status 0, and
+  // disturbing it would break external auth recovery.
+  function isUnexpectedNotFound(err) {
+    return Boolean(err) && Number(err.status) === 404;
+  }
+
+  function unexpectedNotFoundError() {
+    const err = new Error("Milli Mála couldn't reach the helper properly. Please try again.");
+    err.status = 404;
+    err.errorClass = "unexpected_not_found";
+    return err;
+  }
+
+  // Retries at most ONCE, then gives up. `retry` is a shared flag, not a counter, so a 404
+  // after auth recovery cannot start a second round.
+  async function callApiGmGuarded(path, payload, timeout, token, retry) {
+    try {
+      return await callApiGmOnce(path, payload, timeout, token);
+    } catch (err) {
+      if (!isUnexpectedNotFound(err)) throw err;
+      if (retry.used) throw unexpectedNotFoundError();
+
+      retry.used = true;
+      log("unexpected_not_found_retry");
+      await sleep(NOT_FOUND_RETRY_DELAY_MS);
+
+      try {
+        return await callApiGmOnce(path, payload, timeout, token);
+      } catch (retryErr) {
+        if (!isUnexpectedNotFound(retryErr)) throw retryErr;
+        throw unexpectedNotFoundError();
+      }
+    }
+  }
+
   async function callApi(path, payload, timeout) {
     const token = getStoredToken();
 
@@ -1572,8 +1635,10 @@
       throw new Error("No helper token saved. Use Tampermonkey menu → Set helper token.");
     }
 
+    const retry = { used: false };
+
     try {
-      return await callApiGmOnce(path, payload, timeout, token);
+      return await callApiGmGuarded(path, payload, timeout, token, retry);
     } catch (err) {
       if (!err || !err.authRequired) throw err;
     }
@@ -1581,7 +1646,7 @@
     const recovery = await recoverAccessAuth();
 
     try {
-      const response = await callApiGmOnce(path, payload, timeout, token);
+      const response = await callApiGmGuarded(path, payload, timeout, token, retry);
       if (recovery && recovery.closeFailed) {
         return withNotice(response, "Auth complete. Translation retried. You may close the auth tab.");
       }
@@ -1906,7 +1971,10 @@
               ${english ? `<div class="${CLASS.small}" style="margin-top:5px">${h(english)}</div>` : ""}
               ${Array.isArray(breakdown) && breakdown.length ? `<div style="margin-top:6px">${renderBreakdownHtml(breakdown)}</div>` : ""}
               ${notes && notes.trim() ? `<div class="${CLASS.small}" style="margin-top:5px">${h(notes)}</div>` : ""}
-              <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-copy-alt="${index}" style="margin-top:6px">Copy</button>
+              <div class="${CLASS.buttonRow}">
+                <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-use-alt="${index}">Use</button>
+                <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-copy-alt="${index}">Copy</button>
+              </div>
             </div>
           `;
         }).join("")
@@ -1923,7 +1991,10 @@
       <div class="${CLASS.section}">
         <div class="${CLASS.small}">Sendable text</div>
         <div class="${CLASS.pre}">${h(data.text || "")}</div>
-        <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-copy-main style="margin-top:6px">Copy</button>
+        <div class="${CLASS.buttonRow}">
+          <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-use-main>Use</button>
+          <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-copy-main>Copy</button>
+        </div>
       </div>
 
       ${data.english ? `
@@ -1939,7 +2010,6 @@
       </div>
 
       <div class="${CLASS.section}">
-        <div class="${CLASS.small}">Alternatives</div>
         ${altHtml}
       </div>
 
@@ -1952,25 +2022,148 @@
     `;
   }
 
-  function wireComposeCopyButtons(container, data) {
-    const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
+  // The ONLY function in Milli Mála that writes into a Facebook/Messenger element.
+  //
+  // U1a — never auto-send. Structurally guaranteed, not merely intended:
+  //   - dispatches NO keyboard events (no Enter, no keydown/keypress/keyup);
+  //   - calls .click() on NO page element, dispatches no submit;
+  //   - uses only insertText — never insertParagraph/insertLineBreak.
+  // No path through here can reach a send. Richard presses Send himself.
+  //
+  // Writes ONLY to the composer node handed to showComposePanel (the one that was
+  // Ctrl-right-clicked). It must never search the document for a composer: the first
+  // contenteditable on a Facebook page is often a public comment box, and writing
+  // there would be a privacy incident.
+  async function insertIntoComposer(composerEl, text) {
+    const value = String(text || "");
 
-    const main = container.querySelector("[data-rc-copy-main]");
-    if (main) {
-      main.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-        copyText(data.text || "");
-      });
+    // Insertion failing is abnormal and the user only sees "Copied instead" — say why.
+    const reject = reason => {
+      console.warn("[Milli Mála] Use: composer insert rejected —", reason);
+      return false;
+    };
+
+    if (!value) return reject("no text to insert");
+    if (!(composerEl instanceof Element)) return reject("composer reference is not an element");
+    if (!composerEl.isConnected) return reject("composer node is no longer in the page (React replaced it)");
+    if (!composerEl.isContentEditable) return reject("target is not contenteditable");
+
+    // Focus is mandatory: without it execCommand silently no-ops.
+    composerEl.focus();
+
+    // Lexical restores its own caret in its focus handler, which wipes a selection set in the
+    // same tick — that is why a select-all done immediately after focus() is silently collapsed
+    // to the end of the existing text and the insert then does nothing. Yield a frame so our
+    // selection is the last word.
+    await new Promise(resolve => requestAnimationFrame(resolve));
+
+    if (composerEl !== document.activeElement && !composerEl.contains(document.activeElement)) {
+      return reject("composer did not take focus");
     }
 
-    for (const button of container.querySelectorAll("[data-rc-copy-alt]")) {
+    const selection = window.getSelection();
+    if (!selection) return reject("no selection object available");
+
+    // Select the composer's own contents — and nothing else on the page — so that insertText
+    // replaces the draft rather than appending to it.
+    //
+    // Lexical keeps its own selection state and only learns about a programmatic DOM range via
+    // the ASYNCHRONOUS selectionchange event. Firing execCommand in the same tick means Lexical
+    // still holds its stale caret, so its beforeinput handler preventDefault()s, wipes our
+    // selection and writes nothing. Wait for selectionchange to actually land first.
+    await new Promise(resolve => {
+      const settle = () => {
+        document.removeEventListener("selectionchange", settle);
+        window.clearTimeout(timer);
+        resolve();
+      };
+
+      const timer = window.setTimeout(settle, SELECTION_SYNC_TIMEOUT_MS);
+      document.addEventListener("selectionchange", settle);
+
+      const range = document.createRange();
+      range.selectNodeContents(composerEl);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+
+    // Refuse to type anywhere outside the intended composer.
+    if (!composerEl.contains(selection.anchorNode)) return reject("selection landed outside the composer");
+    if (selection.isCollapsed) return reject("editor collapsed the selection before insert");
+
+    document.execCommand("insertText", false, value);
+
+    // execCommand returns true even when a rich-text editor discards the result,
+    // so verify against the DOM rather than trusting the return value.
+    const normalise = candidate => String(candidate || "").replace(/\s+/g, " ").trim();
+    if (!normalise(composerEl.innerText).includes(normalise(value))) {
+      return reject("editor discarded the text (execCommand claimed success)");
+    }
+
+    return true;
+  }
+
+  function flashButton(button, label) {
+    const original = button.dataset.rcLabel || button.textContent;
+    button.dataset.rcLabel = original;
+    button.textContent = label;
+
+    window.setTimeout(() => {
+      if (button.isConnected) button.textContent = button.dataset.rcLabel || original;
+    }, 1200);
+  }
+
+  // If the composer rejected the insert, fall back to the clipboard and say so, so there
+  // is never a dead button with no way to get the text out.
+  async function useText(button, value, composerEl) {
+    if (await insertIntoComposer(composerEl, value)) {
+      flashButton(button, "Inserted ✓");
+      return;
+    }
+
+    copyText(value);
+    flashButton(button, "Copied instead ✓");
+  }
+
+  function altText(alt) {
+    if (typeof alt === "string") return alt;
+    return alt && alt.text ? String(alt.text) : "";
+  }
+
+  function wireComposeResultButtons(container, data, composerEl) {
+    const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
+
+    const bind = (button, value, handler) => {
       button.addEventListener("click", event => {
         event.preventDefault();
         event.stopPropagation();
-        const index = Number(button.getAttribute("data-rc-copy-alt"));
-        const alt = alternatives[index];
-        copyText(typeof alt === "string" ? alt : (alt && alt.text ? alt.text : ""));
+        handler(button, value);
+      });
+    };
+
+    const useMain = container.querySelector("[data-rc-use-main]");
+    if (useMain) {
+      bind(useMain, String(data.text || ""), (button, value) => useText(button, value, composerEl));
+    }
+
+    const copyMain = container.querySelector("[data-rc-copy-main]");
+    if (copyMain) {
+      bind(copyMain, String(data.text || ""), (button, value) => {
+        copyText(value);
+        flashButton(button, "Copied ✓");
+      });
+    }
+
+    for (const button of container.querySelectorAll("[data-rc-use-alt]")) {
+      const index = Number(button.getAttribute("data-rc-use-alt"));
+      bind(button, altText(alternatives[index]), (target, value) => useText(target, value, composerEl));
+    }
+
+    for (const button of container.querySelectorAll("[data-rc-copy-alt]")) {
+      const index = Number(button.getAttribute("data-rc-copy-alt"));
+      bind(button, altText(alternatives[index]), (target, value) => {
+        copyText(value);
+        flashButton(target, "Copied ✓");
       });
     }
   }
@@ -2013,24 +2206,16 @@
 
     body.innerHTML = `
       <div class="${CLASS.section}">
-        <div class="${CLASS.label}">Draft text read from composer</div>
         <textarea class="${CLASS.textarea}" data-rc-compose-text>${h(initialText)}</textarea>
         <div class="${CLASS.small}" data-rc-compose-warning style="display:none;margin-top:4px;color:#ff5a5a"></div>
       </div>
 
       <div class="${CLASS.formRow}">
-        <div class="${CLASS.formGroup}">
-          <div class="${CLASS.label}">Tone</div>
-          <select class="${CLASS.select}" data-rc-compose-tone>
-            ${TONES.map(([value, label]) => `<option value="${h(value)}">${h(label)}</option>`).join("")}
-          </select>
-        </div>
+        <select class="${CLASS.select}" data-rc-compose-tone>
+          ${TONES.map(([value, label]) => `<option value="${h(value)}">${h(label)}</option>`).join("")}
+        </select>
 
-        <button type="button" class="${CLASS.button}" data-rc-compose-generate>Generate</button>
-      </div>
-
-      <div class="${CLASS.small}" style="margin-top:8px">
-        Reads this local composer text only. Does not insert, send, react, or click anything in Messenger.
+        <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-compose-generate>Generate</button>
       </div>
 
       <div class="${CLASS.section}" data-rc-compose-output></div>
@@ -2044,6 +2229,14 @@
     const generateEl = body.querySelector("[data-rc-compose-generate]");
     const warningEl = body.querySelector("[data-rc-compose-warning]");
     const outputEl = body.querySelector("[data-rc-compose-output]");
+
+    // Grow the draft box to fit its content so the text read from the composer is fully
+    // visible on open, rather than reserving a fixed block of empty height. CSS min-height
+    // floors it at ~2 lines and max-height caps it, after which the textarea scrolls.
+    function autoSizeTextarea() {
+      textEl.style.height = "auto";
+      textEl.style.height = `${textEl.scrollHeight}px`;
+    }
 
     // Block sending an over-long draft: grey out Generate and warn, instead of
     // letting the helper silently truncate. Recomputed on every edit.
@@ -2060,7 +2253,12 @@
       return overLimit;
     }
 
-    textEl.addEventListener("input", refreshComposeLimit);
+    textEl.addEventListener("input", () => {
+      autoSizeTextarea();
+      refreshComposeLimit();
+    });
+
+    autoSizeTextarea();
     refreshComposeLimit();
 
     generateEl.addEventListener("click", async event => {
@@ -2099,7 +2297,7 @@
         try {
           const response = await postCompose(tone, text, providerAction);
           outputEl.innerHTML = renderComposeResultHtml(response);
-          wireComposeCopyButtons(outputEl, response);
+          wireComposeResultButtons(outputEl, response, composerEl);
           placeComposePanel(activePanel, composerEl);
         } catch (err) {
           renderComposeError(err);
@@ -2120,6 +2318,8 @@
   }
 
   function start() {
+    console.info("[Milli Mála] build", BUILD_ID, "loaded");
+
     cleanupOldInjectedUi();
     injectStyles();
 

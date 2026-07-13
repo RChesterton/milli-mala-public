@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.14
+// @version      0.5.15
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -35,7 +35,7 @@
   // Printed once on load, so the running copy is always identifiable. During a debug cycle
   // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
   // means this is the released artifact.
-  const BUILD_ID = "0.5.14";
+  const BUILD_ID = "0.5.15";
 
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
@@ -1668,7 +1668,7 @@
   }
 
   function postCompose(tone, text, providerAction = "", provider = "") {
-    return callApi("/compose", { model: "medium", tone, text, providerAction, provider }, 240000);
+    return callApi("/compose", { model: "low", tone, text, providerAction, provider }, 240000);
   }
 
   function closeMenu() {
@@ -1836,47 +1836,47 @@
     menu.className = CLASS.menu;
 
     addMenuButton(menu, "EN-", "Translate to English with GPT-OSS", button => {
-      translateActiveMessage("EN-", "medium", "EN-", button);
+      translateActiveMessage("EN-", "low", "EN-", button);
     });
 
     addMenuButton(menu, "EN", "Translate to English", button => {
-      translateActiveMessage("EN", "medium", "EN", button);
+      translateActiveMessage("EN", "low", "EN", button);
     });
 
-    // (v) = same prompt, same mode, but routed to Vertex AI. Deliberately paired with its non-Vertex
+    // (V) = same prompt, same mode, but routed to Vertex AI. Deliberately paired with its non-Vertex
     // twin so the two are directly comparable on quality, speed and cost.
-    addMenuButton(menu, "EN (v)", "Translate to English via Vertex AI", button => {
-      translateActiveMessage("EN", "medium", "EN (v)", button, "", "vertex");
+    addMenuButton(menu, "EN (V)", "Translate to English via Vertex AI", button => {
+      translateActiveMessage("EN", "low", "EN (V)", button, "", "vertex");
     });
 
     addMenuButton(menu, "EN+", "Translate to English and break down", button => {
-      translateActiveMessage("EN+", "medium", "EN+", button);
+      translateActiveMessage("EN+", "low", "EN+", button);
     });
 
-    addMenuButton(menu, "EN+ (v)", "Translate to English and break down via Vertex AI", button => {
-      translateActiveMessage("EN+", "medium", "EN+ (v)", button, "", "vertex");
+    addMenuButton(menu, "EN+ (V)", "Translate to English and break down via Vertex AI", button => {
+      translateActiveMessage("EN+", "low", "EN+ (V)", button, "", "vertex");
     });
 
     addMenuDivider(menu);
 
     addMenuButton(menu, "IS-", "Translate to Icelandic with GPT-OSS", button => {
-      translateActiveMessage("IS-", "medium", "IS-", button);
+      translateActiveMessage("IS-", "low", "IS-", button);
     });
 
     addMenuButton(menu, "IS", "Translate to Icelandic", button => {
-      translateActiveMessage("IS", "medium", "IS", button);
+      translateActiveMessage("IS", "low", "IS", button);
     });
 
-    addMenuButton(menu, "IS (v)", "Translate to Icelandic via Vertex AI", button => {
-      translateActiveMessage("IS", "medium", "IS (v)", button, "", "vertex");
+    addMenuButton(menu, "IS (V)", "Translate to Icelandic via Vertex AI", button => {
+      translateActiveMessage("IS", "low", "IS (V)", button, "", "vertex");
     });
 
     addMenuButton(menu, "IS+", "Translate to Icelandic and break down", button => {
-      translateActiveMessage("IS+", "medium", "IS+", button);
+      translateActiveMessage("IS+", "low", "IS+", button);
     });
 
-    addMenuButton(menu, "IS+ (v)", "Translate to Icelandic and break down via Vertex AI", button => {
-      translateActiveMessage("IS+", "medium", "IS+ (v)", button, "", "vertex");
+    addMenuButton(menu, "IS+ (V)", "Translate to Icelandic and break down via Vertex AI", button => {
+      translateActiveMessage("IS+", "low", "IS+ (V)", button, "", "vertex");
     });
 
     menu.addEventListener("click", event => {
@@ -1908,8 +1908,8 @@
       messageEl.__rcLocalTranslateCache = {};
     }
 
-    // `provider` belongs in the key: EN and EN (v) share a mode and text but must never serve each
-    // other's cached result — comparing them is the point of the (v) buttons.
+    // `provider` belongs in the key: EN and EN (V) share a mode and text but must never serve each
+    // other's cached result — comparing them is the point of the (V) buttons.
     const cacheKey = `${mode}:${model}:${provider}:${providerAction}:${text}`;
 
     if (messageEl.__rcLocalTranslateCache[cacheKey]) {
@@ -2072,6 +2072,10 @@
     if (!composerEl.isConnected) return reject("composer node is no longer in the page (React replaced it)");
     if (!composerEl.isContentEditable) return reject("target is not contenteditable");
 
+    // Whether there was anything to replace. An empty composer legitimately yields a collapsed
+    // selection later, and that must not be treated as a failure — see the guard below.
+    const hadText = Boolean(String(composerEl.innerText || "").trim());
+
     // Focus is mandatory: without it execCommand silently no-ops.
     composerEl.focus();
 
@@ -2113,7 +2117,15 @@
 
     // Refuse to type anywhere outside the intended composer.
     if (!composerEl.contains(selection.anchorNode)) return reject("selection landed outside the composer");
-    if (selection.isCollapsed) return reject("editor collapsed the selection before insert");
+
+    // A collapsed selection is only a FAILURE if there was text to select. An EMPTY composer has
+    // nothing to select, so the selection is legitimately collapsed — and insertText at a collapsed
+    // caret is exactly right. The old unconditional guard rejected that case and fell back to the
+    // clipboard, so "Use" silently refused to work whenever the composer was empty.
+    // The guard still does its real job: catching Lexical DESTROYING a selection we did make.
+    if (selection.isCollapsed && hadText) {
+      return reject("editor collapsed the selection before insert");
+    }
 
     document.execCommand("insertText", false, value);
 

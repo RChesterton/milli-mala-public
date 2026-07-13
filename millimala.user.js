@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.13
+// @version      0.5.14
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -35,7 +35,7 @@
   // Printed once on load, so the running copy is always identifiable. During a debug cycle
   // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
   // means this is the released artifact.
-  const BUILD_ID = "0.5.13";
+  const BUILD_ID = "0.5.14";
 
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
@@ -1660,13 +1660,15 @@
     }
   }
 
-  function postTranslate(mode, model, text, providerAction = "") {
+  // `provider` selects a provider explicitly ("vertex"); the mode string is unchanged, because the
+  // helper derives the prompt from the +/- suffix. Empty means the normal AGY-first chain.
+  function postTranslate(mode, model, text, providerAction = "", provider = "") {
     const timeout = mode.endsWith("+") || model === "high" ? 240000 : 160000;
-    return callApi("/translate", { mode, model, text, providerAction }, timeout);
+    return callApi("/translate", { mode, model, text, providerAction, provider }, timeout);
   }
 
-  function postCompose(tone, text, providerAction = "") {
-    return callApi("/compose", { model: "medium", tone, text, providerAction }, 240000);
+  function postCompose(tone, text, providerAction = "", provider = "") {
+    return callApi("/compose", { model: "medium", tone, text, providerAction, provider }, 240000);
   }
 
   function closeMenu() {
@@ -1841,8 +1843,18 @@
       translateActiveMessage("EN", "medium", "EN", button);
     });
 
+    // (v) = same prompt, same mode, but routed to Vertex AI. Deliberately paired with its non-Vertex
+    // twin so the two are directly comparable on quality, speed and cost.
+    addMenuButton(menu, "EN (v)", "Translate to English via Vertex AI", button => {
+      translateActiveMessage("EN", "medium", "EN (v)", button, "", "vertex");
+    });
+
     addMenuButton(menu, "EN+", "Translate to English and break down", button => {
       translateActiveMessage("EN+", "medium", "EN+", button);
+    });
+
+    addMenuButton(menu, "EN+ (v)", "Translate to English and break down via Vertex AI", button => {
+      translateActiveMessage("EN+", "medium", "EN+ (v)", button, "", "vertex");
     });
 
     addMenuDivider(menu);
@@ -1855,8 +1867,16 @@
       translateActiveMessage("IS", "medium", "IS", button);
     });
 
+    addMenuButton(menu, "IS (v)", "Translate to Icelandic via Vertex AI", button => {
+      translateActiveMessage("IS", "medium", "IS (v)", button, "", "vertex");
+    });
+
     addMenuButton(menu, "IS+", "Translate to Icelandic and break down", button => {
       translateActiveMessage("IS+", "medium", "IS+", button);
+    });
+
+    addMenuButton(menu, "IS+ (v)", "Translate to Icelandic and break down via Vertex AI", button => {
+      translateActiveMessage("IS+", "medium", "IS+ (v)", button, "", "vertex");
     });
 
     menu.addEventListener("click", event => {
@@ -1868,7 +1888,7 @@
     placeTranslateMenu(menu, messageEl, targetEl, placement);
   }
 
-  async function translateActiveMessage(mode, model, label, button, providerAction = "") {
+  async function translateActiveMessage(mode, model, label, button, providerAction = "", provider = "") {
     const context = activeContext;
     const messageEl = context && context.messageEl;
     const targetEl = context && context.targetEl;
@@ -1888,7 +1908,9 @@
       messageEl.__rcLocalTranslateCache = {};
     }
 
-    const cacheKey = `${mode}:${model}:${providerAction}:${text}`;
+    // `provider` belongs in the key: EN and EN (v) share a mode and text but must never serve each
+    // other's cached result — comparing them is the point of the (v) buttons.
+    const cacheKey = `${mode}:${model}:${provider}:${providerAction}:${text}`;
 
     if (messageEl.__rcLocalTranslateCache[cacheKey]) {
       const cachedText = messageEl.__rcLocalTranslateCache[cacheKey];
@@ -1915,7 +1937,7 @@
         placement
       );
 
-      const response = await postTranslate(mode, model, text, providerAction);
+      const response = await postTranslate(mode, model, text, providerAction, provider);
       const resultText = String(response.text || "");
       const noticeText = String(response.notice || "").trim();
       const displayText = noticeText ? `${noticeText}\n\n${resultText}` : resultText;
@@ -1927,7 +1949,8 @@
     } catch (err) {
       if (helperActions(err).length) {
         showActionError(messageEl, `${label} error`, err, (action, actionButton) => {
-          translateActiveMessage(mode, model, label, actionButton, action.id);
+          // Keep the provider on a retry: an alternate offered by a Vertex failure is a Vertex model.
+          translateActiveMessage(mode, model, label, actionButton, action.id, provider);
         }, targetEl, placement);
       } else {
         showError(messageEl, `${label} error`, err, targetEl, placement);
@@ -2217,6 +2240,7 @@
         </select>
 
         <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-compose-generate>Generate</button>
+        <button type="button" class="${CLASS.button} ${CLASS.secondaryButton}" data-rc-compose-vertex>Vertex</button>
       </div>
 
       <div class="${CLASS.section}" data-rc-compose-output></div>
@@ -2228,6 +2252,7 @@
     const textEl = body.querySelector("[data-rc-compose-text]");
     const toneEl = body.querySelector("[data-rc-compose-tone]");
     const generateEl = body.querySelector("[data-rc-compose-generate]");
+    const vertexEl = body.querySelector("[data-rc-compose-vertex]");
     const warningEl = body.querySelector("[data-rc-compose-warning]");
     const outputEl = body.querySelector("[data-rc-compose-output]");
 
@@ -2239,12 +2264,13 @@
       textEl.style.height = `${textEl.scrollHeight}px`;
     }
 
-    // Block sending an over-long draft: grey out Generate and warn, instead of
+    // Block sending an over-long draft: grey out both send buttons and warn, instead of
     // letting the helper silently truncate. Recomputed on every edit.
     function refreshComposeLimit() {
       const length = String(textEl.value || "").length;
       const overLimit = length > MAX_INPUT_CHARS;
       generateEl.disabled = overLimit;
+      if (vertexEl) vertexEl.disabled = overLimit;
       if (warningEl) {
         warningEl.style.display = overLimit ? "" : "none";
         warningEl.textContent = overLimit
@@ -2262,10 +2288,9 @@
     autoSizeTextarea();
     refreshComposeLimit();
 
-    generateEl.addEventListener("click", async event => {
-      event.preventDefault();
-      event.stopPropagation();
-
+    // Generate and Vertex differ only by which provider the helper is told to use. Same prompt,
+    // same tone, same draft — so the two outputs are directly comparable.
+    async function startCompose(provider) {
       if (refreshComposeLimit()) return;
 
       const text = String(textEl.value || "").trim();
@@ -2294,9 +2319,10 @@
         placeComposePanel(activePanel, composerEl);
       };
 
+      // An alternate offered by a Vertex failure is a Vertex model, so `provider` rides along.
       const runCompose = async (providerAction = "") => {
         try {
-          const response = await postCompose(tone, text, providerAction);
+          const response = await postCompose(tone, text, providerAction, provider);
           outputEl.innerHTML = renderComposeResultHtml(response);
           wireComposeResultButtons(outputEl, response, composerEl);
           placeComposePanel(activePanel, composerEl);
@@ -2306,6 +2332,7 @@
       };
 
       generateEl.disabled = true;
+      if (vertexEl) vertexEl.disabled = true;
       outputEl.innerHTML = `<div class="${CLASS.pre}">Generating…</div>`;
       placeComposePanel(activePanel, composerEl);
 
@@ -2313,9 +2340,24 @@
         await runCompose();
       } finally {
         generateEl.disabled = false;
+        if (vertexEl) vertexEl.disabled = false;
         refreshComposeLimit();
       }
+    }
+
+    generateEl.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      startCompose("");
     });
+
+    if (vertexEl) {
+      vertexEl.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        startCompose("vertex");
+      });
+    }
   }
 
   function start() {

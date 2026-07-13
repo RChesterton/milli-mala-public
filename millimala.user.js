@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.16
+// @version      0.5.17
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -35,7 +35,7 @@
   // Printed once on load, so the running copy is always identifiable. During a debug cycle
   // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
   // means this is the released artifact.
-  const BUILD_ID = "0.5.16";
+  const BUILD_ID = "0.5.17";
 
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
@@ -1767,9 +1767,33 @@
     return err && Array.isArray(err.actions) ? err.actions.filter(action => action && action.id && action.label) : [];
   }
 
-  function showActionError(anchorEl, title, err, onAction, targetEl = null, placement = null) {
+  /**
+   * Which failures earn a Retry button — and, just as importantly, which do NOT.
+   *
+   * ONLY `model_output_unparseable` (B-011). The model answered, was paid for, and produced output
+   * that would not parse. These models are non-deterministic (identical output only 1-6 times in 10),
+   * so simply asking the same model again is very likely to work, and costs exactly one request.
+   *
+   * Deliberately NOT offered on a timeout, a 503-busy, or a quota failure. A same-model retry there
+   * is likely to fail again and BURNS SCARCE QUOTA (the top of the chain is 20 requests/day). Those
+   * keep their existing behaviour: the helper offers eligible ALTERNATE models, or cancel. That is
+   * P3 — a failure surfaces a choice; it never silently retries or switches.
+   *
+   * Retry re-issues the IDENTICAL request: same mode, same model, same provider. It is not a
+   * fallback. Falling through the chain here would be wrong for three reasons: two of B-011's three
+   * possible causes (MAX_TOKENS, SAFETY) would fail the same way on every model in the chain, so one
+   * failure would burn four requests; a (V) request has no chain to walk and would silently return a
+   * non-Vertex answer under a Vertex label; and it would muddy the 0.5.16 diagnostic we are waiting on.
+   */
+  const RETRYABLE_ERROR_CLASSES = new Set(["model_output_unparseable"]);
+
+  function isRetryableError(err) {
+    return Boolean(err && RETRYABLE_ERROR_CLASSES.has(err.errorClass));
+  }
+
+  function showActionError(anchorEl, title, err, onAction, targetEl = null, placement = null, onRetry = null) {
     const actions = helperActions(err);
-    if (!actions.length) {
+    if (!actions.length && !onRetry) {
       showError(anchorEl, title, err, targetEl, placement);
       return;
     }
@@ -1782,6 +1806,22 @@
 
     const section = document.createElement("div");
     section.className = CLASS.section;
+
+    if (onRetry) {
+      const retryButton = document.createElement("button");
+      retryButton.className = `${CLASS.button} ${CLASS.secondaryButton}`;
+      retryButton.type = "button";
+      retryButton.textContent = "Retry";
+      retryButton.title = "Ask the same model again";
+      retryButton.style.marginRight = "6px";
+      retryButton.style.marginTop = "6px";
+      retryButton.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        onRetry(retryButton);
+      });
+      section.appendChild(retryButton);
+    }
 
     for (const action of actions) {
       const button = document.createElement("button");
@@ -1835,10 +1875,6 @@
     const menu = document.createElement("div");
     menu.className = CLASS.menu;
 
-    addMenuButton(menu, "EN-", "Translate to English with GPT-OSS", button => {
-      translateActiveMessage("EN-", "low", "EN-", button);
-    });
-
     addMenuButton(menu, "EN", "Translate to English", button => {
       translateActiveMessage("EN", "low", "EN", button);
     });
@@ -1858,10 +1894,6 @@
     });
 
     addMenuDivider(menu);
-
-    addMenuButton(menu, "IS-", "Translate to Icelandic with GPT-OSS", button => {
-      translateActiveMessage("IS-", "low", "IS-", button);
-    });
 
     addMenuButton(menu, "IS", "Translate to Icelandic", button => {
       translateActiveMessage("IS", "low", "IS", button);
@@ -1947,11 +1979,17 @@
       const modelLabel = response.cached ? "cached" : (response.modelName || response.model || model);
       showTextPanel(messageEl, `${label} · ${modelLabel}`, displayText, false, resultText, "", targetEl, placement);
     } catch (err) {
-      if (helperActions(err).length) {
+      // Retry re-issues this exact request — same mode, same model, same provider, same
+      // providerAction. It is not a fallback and must never become one (see isRetryableError).
+      const onRetry = isRetryableError(err)
+        ? retryButton => translateActiveMessage(mode, model, label, retryButton, providerAction, provider)
+        : null;
+
+      if (helperActions(err).length || onRetry) {
         showActionError(messageEl, `${label} error`, err, (action, actionButton) => {
-          // Keep the provider on a retry: an alternate offered by a Vertex failure is a Vertex model.
+          // Keep the provider on an alternate: one offered by a Vertex failure is a Vertex model.
           translateActiveMessage(mode, model, label, actionButton, action.id, provider);
-        }, targetEl, placement);
+        }, targetEl, placement, onRetry);
       } else {
         showError(messageEl, `${label} error`, err, targetEl, placement);
       }
@@ -2206,11 +2244,21 @@
 
   function renderHelperActionErrorHtml(err) {
     const actions = helperActions(err);
+    const retryable = isRetryableError(err);
 
     return `
       <div class="${CLASS.pre}">${h(err && err.message ? err.message : err)}</div>
-      ${actions.length ? `
+      ${actions.length || retryable ? `
         <div class="${CLASS.section}">
+          ${retryable ? `
+            <button
+              type="button"
+              class="${CLASS.button} ${CLASS.secondaryButton}"
+              data-rc-retry="1"
+              title="Ask the same model again"
+              style="margin-top:6px;margin-right:6px"
+            >Retry</button>
+          ` : ""}
           ${actions.map(action => `
             <button
               type="button"
@@ -2222,6 +2270,16 @@
         </div>
       ` : ""}
     `;
+  }
+
+  function wireRetryButton(container, onRetry) {
+    const button = container.querySelector("[data-rc-retry]");
+    if (!button) return;
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      onRetry(button);
+    });
   }
 
   function wireHelperActionButtons(container, onAction) {
@@ -2325,6 +2383,21 @@
             if (actionButton.isConnected) {
               actionButton.disabled = false;
               actionButton.textContent = originalActionText;
+            }
+          }
+        });
+        // Retry = the same draft, tone, model and provider, asked again. `runCompose()` with no
+        // providerAction re-issues exactly the request that just failed.
+        wireRetryButton(outputEl, async retryButton => {
+          const originalRetryText = retryButton.textContent;
+          try {
+            retryButton.disabled = true;
+            retryButton.textContent = "Generating…";
+            await runCompose();
+          } finally {
+            if (retryButton.isConnected) {
+              retryButton.disabled = false;
+              retryButton.textContent = originalRetryText;
             }
           }
         });

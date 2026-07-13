@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.12
+// @version      0.5.13
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -35,12 +35,12 @@
   // Printed once on load, so the running copy is always identifiable. During a debug cycle
   // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
   // means this is the released artifact.
-  const BUILD_ID = "0.5.12";
+  const BUILD_ID = "0.5.13";
 
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
   const AUTH_POLL_MAX_ATTEMPTS = 120;
-  const NOT_FOUND_RETRY_DELAY_MS = 400;
+  const UNEXPECTED_ROUTE_RETRY_DELAY_MS = 400;
   const SELECTION_SYNC_TIMEOUT_MS = 50;
   const VIEWPORT_MARGIN = 12;
   const PANEL_GAP = 6;
@@ -1590,40 +1590,41 @@
     };
   }
 
-  // A 404 from /translate or /compose is impossible in normal operation — those routes always
-  // exist. Seen once (2026-07-11) as a GET the userscript never sent, meaning something turned
-  // the POST into a GET and dropped the body. Cause unknown, so this treats the symptom only.
+  // A 404 or 405 from /translate or /compose is impossible in normal operation — those routes
+  // always exist and the userscript always POSTs. Seen once (2026-07-11) as a GET the userscript
+  // never sent, meaning something turned the POST into a GET and dropped the body. Cause unknown,
+  // so this treats the symptom only.
   // Deliberately NOT wired into the Cloudflare Access path: that keys off status 0, and
   // disturbing it would break external auth recovery.
-  function isUnexpectedNotFound(err) {
-    return Boolean(err) && Number(err.status) === 404;
+  function isUnexpectedRouteFailure(err) {
+    const status = Number(err && err.status);
+    return status === 404 || status === 405;
   }
 
-  function unexpectedNotFoundError() {
+  function unexpectedRouteError(status) {
     const err = new Error("Milli Mála couldn't reach the helper properly. Please try again.");
-    err.status = 404;
-    err.errorClass = "unexpected_not_found";
+    err.status = status;
+    err.errorClass = "unexpected_route_failure";
     return err;
   }
 
-  // Retries at most ONCE, then gives up. `retry` is a shared flag, not a counter, so a 404
-  // after auth recovery cannot start a second round.
+  // Retries at most ONCE, then gives up. `retry` is a shared flag, not a counter, so a route
+  // failure after auth recovery cannot start a second round.
   async function callApiGmGuarded(path, payload, timeout, token, retry) {
     try {
       return await callApiGmOnce(path, payload, timeout, token);
     } catch (err) {
-      if (!isUnexpectedNotFound(err)) throw err;
-      if (retry.used) throw unexpectedNotFoundError();
+      if (!isUnexpectedRouteFailure(err)) throw err;
+      if (retry.used) throw unexpectedRouteError(err.status);
 
       retry.used = true;
-      log("unexpected_not_found_retry");
-      await sleep(NOT_FOUND_RETRY_DELAY_MS);
+      await sleep(UNEXPECTED_ROUTE_RETRY_DELAY_MS);
 
       try {
         return await callApiGmOnce(path, payload, timeout, token);
       } catch (retryErr) {
-        if (!isUnexpectedNotFound(retryErr)) throw retryErr;
-        throw unexpectedNotFoundError();
+        if (!isUnexpectedRouteFailure(retryErr)) throw retryErr;
+        throw unexpectedRouteError(retryErr.status);
       }
     }
   }

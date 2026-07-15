@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Milli Mála
 // @namespace    https://millimala.chesterton.is/
-// @version      0.5.18
+// @version      0.5.19
 // @description  Ctrl+right-click Messenger messages to translate/explain; Ctrl+right-click composer to draft Icelandic locally. Inserts into your own composer only when you click Use. Never sends, reacts, or clicks Messenger.
 // @updateURL    https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
 // @downloadURL  https://raw.githubusercontent.com/RChesterton/milli-mala-public/main/millimala.user.js
@@ -35,7 +35,7 @@
   // Printed once on load, so the running copy is always identifiable. During a debug cycle
   // inside one version, hand-over builds carry a "-dev.N" suffix; a bare version number
   // means this is the released artifact.
-  const BUILD_ID = "0.5.18";
+  const BUILD_ID = "0.5.19";
 
   const TOKEN_STORAGE_KEY = "rcmt_helper_token";
   const AUTH_POLL_INTERVAL_MS = 1000;
